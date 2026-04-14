@@ -1,0 +1,104 @@
+import os
+import time
+from pathlib import Path
+
+import requests
+from yt_dlp import YoutubeDL
+
+API_KEY = os.getenv("SUPADATA_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Missing SUPADATA_API_KEY")
+
+CHANNEL_URL = "https://www.youtube.com/@AhrefsTutorials/videos"
+MAX_VIDEOS = 5
+OUT_DIR = Path("research/youtube-transcripts")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def slugify(text: str) -> str:
+    return "".join(c.lower() if c.isalnum() else "-" for c in text).strip("-")
+
+def get_recent_videos(channel_url: str, max_videos: int):
+    ydl_opts = {
+        "extract_flat": True,
+        "playlistend": max_videos,
+        "quiet": True,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        data = ydl.extract_info(channel_url, download=False)
+
+    channel_name = (
+        data.get("channel")
+        or data.get("uploader")
+        or data.get("title")
+        or channel_url.rstrip("/").split("/")[-1]
+    )
+
+    entries = data.get("entries", [])[:max_videos]
+    videos = [
+        {
+            "id": e.get("id"),
+            "title": e.get("title", "Untitled"),
+            "url": f"https://www.youtube.com/watch?v={e.get('id')}",
+        }
+        for e in entries if e.get("id")
+    ]
+    return channel_name, videos
+
+def fetch_transcript(video_url: str):
+    headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
+    params = {"url": video_url, "text": "true", "mode": "auto", "lang": "en"}
+
+    r = requests.get("https://api.supadata.ai/v1/transcript", headers=headers, params=params, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+
+    # Async job case
+    if "jobId" in data:
+        job_id = data["jobId"]
+        for _ in range(20):
+            time.sleep(3)
+            jr = requests.get(f"https://api.supadata.ai/v1/transcript/{job_id}", headers=headers, timeout=60)
+            jr.raise_for_status()
+            jdata = jr.json()
+            if "content" in jdata:
+                return jdata
+        raise TimeoutError(f"Transcript job timed out: {job_id}")
+
+    return data
+
+def save_markdown(channel_name: str, videos_with_transcripts: list[dict]):
+    path = OUT_DIR / f"{slugify(channel_name)}.md"
+    lines = [f"# {channel_name}", ""]
+    for i, v in enumerate(videos_with_transcripts, 1):
+        lines += [
+            f"## Video {i}",
+            f"Title: {v['title']}",
+            f"Link: {v['url']}",
+            "",
+            "### Transcript Excerpt",
+            (v["transcript"][:4000] + "...") if len(v["transcript"]) > 4000 else v["transcript"],
+            "",
+        ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Saved: {path}")
+
+def main():
+    channel_name, videos = get_recent_videos(CHANNEL_URL, MAX_VIDEOS)
+    output = []
+    for v in videos:
+        try:
+            t = fetch_transcript(v["url"])
+            content = t.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(chunk.get("text", "") for chunk in content)
+            output.append({**v, "transcript": content})
+            print(f"OK: {v['title']}")
+        except Exception as e:
+            print(f"Failed: {v['title']} -> {e}")
+
+    save_markdown(channel_name, output)
+
+if __name__ == "__main__":
+    main()
+
+    
